@@ -1,0 +1,22 @@
+# hyperlaunch shortcuts:  key = app to open with Hyper (Caps Lock) + that key
+# (Hyperlaunch.app edits this file for you; you can also edit it by hand.)
+#
+# key: a-z, 0-9, f1-f12, space, return, tab, escape, delete, left, right, up, down,
+#      or one of  - [ ] ; ' , . / \ `   (write "equal" for the = key)
+# app: a full path, or just the app's name (anything `open -a` accepts)
+#
+# when-in-front: what a shortcut does when its app is already in front.
+#   minimize (minimize its windows), hide (like Cmd+H), or nothing (just bring it forward).
+#   Pressing the shortcut again brings the app back.
+#
+# Changes apply as soon as you save; no restart needed.
+# To check this file:  ~/.local/bin/hyperlaunch --check
+
+when-in-front = minimize
+
+b = Safari
+e = /System/Library/CoreServices/Finder.app
+t = Terminal
+n = Notes
+s = System Settings
+, = ~/Applications/Hyperlaunch.app
