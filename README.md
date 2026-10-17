@@ -1,17 +1,21 @@
 # hyperlaunch
 
-A tiny macOS tool that turns **Caps Lock into a Hyper key** (⌘⌃⌥⇧) and lets you
-**open apps with Hyper + a key**. It replaces a common two-rule Karabiner-Elements
-setup while using about 4 MB of memory.
+A tiny macOS tool that turns **Caps Lock (or any key) into a Hyper key** (⌃⌥⇧⌘),
+can **remap keys to shortcuts**, and lets you **open apps with Hyper + a key**. It
+replaces a common Karabiner-Elements setup while using about 4 MB of memory.
 
-- **Caps Lock → Hyper.** Hold Caps Lock and every key you press gets ⌘⌃⌥⇧, so
-  Hyper shortcuts in other apps (Raycast, Rectangle and so on) keep working. Caps
-  Lock on its own does nothing, and its light never comes on.
+- **Hyper keys.** Hold Caps Lock and every key you press gets ⌃⌥⇧⌘, so Hyper
+  shortcuts in other apps (Raycast, Rectangle and so on) keep working. You can
+  make any other key a Hyper key too, or pick fewer modifiers (for example ⌃⌥⇧).
+  The key on its own does nothing, and the Caps Lock light never comes on.
+- **Remapped keys.** Make a key press a shortcut instead. For example, the
+  🎤 Dictation key can press ⌥Space to start a voice-to-text app instead of
+  macOS Dictation. Holding the key holds the shortcut, so push-to-talk works.
 - **Hyper + key opens an app.** For example, Caps Lock + T opens Terminal.
 - **Toggle.** If the app is already in front, the same shortcut minimizes it (or
   hides it). Press it again and the app comes back.
-- **Settings app.** Hyperlaunch.app lets you add and remove shortcuts with a
-  window instead of editing a file. It only runs while its window is open.
+- **Settings app.** Hyperlaunch.app lets you set all of this up in a window. It
+  only runs while its window is open.
 
 | Part | What it is | Memory |
 |---|---|---|
@@ -32,7 +36,7 @@ cd hyperlaunch && ./install.sh
 ```
 
 If you use Karabiner-Elements, quit it first from its menu bar icon. Otherwise
-it keeps grabbing Caps Lock.
+it keeps grabbing your keys.
 
 macOS then asks you to give **hyperlaunch** Accessibility access. Switch it on in
 System Settings > Privacy & Security > Accessibility, and Caps Lock becomes Hyper a
@@ -42,7 +46,7 @@ The installer puts:
 
 - the background tool in `~/.local/bin/hyperlaunch`,
 - the settings app in `~/Applications/Hyperlaunch.app`,
-- your shortcuts in `~/.config/hyperlaunch/config` (starting from the example
+- your settings in `~/.config/hyperlaunch/config` (starting from the example
   [`config`](config)),
 - a login item in `~/Library/LaunchAgents/local.hyperlaunch.plist`.
 
@@ -53,17 +57,30 @@ The installer puts:
 
 ## Use
 
-Open **Hyperlaunch.app** from Spotlight, or press Caps Lock + , (comma). In the
-app you can:
+Open **Hyperlaunch.app** from Spotlight, or press Caps Lock + , (comma). It has
+three sections.
 
-- add a shortcut: click **Add Shortcut…**, pick an app, then press a key,
-- remove a shortcut with its trash button,
-- choose what happens when the app is already in front: **Minimize it**,
-  **Hide it**, or **Leave it open**.
+**Keys**: click **Add Key…**, press the key you want to change (or pick Caps Lock,
+🎤 Dictation, Spotlight or Do Not Disturb from **Special Keys**), then choose:
+
+- **A Hyper key**, and which modifiers it holds. All four make a full Hyper key,
+  which also opens your app shortcuts.
+- **A shortcut**, and record the shortcut it should press.
+
+Use the pencil to change a key or the trash to put it back to normal.
+
+**App Shortcuts**: click **Add Shortcut…**, pick an app, then press a key. Remove
+one with its trash button.
+
+**If the app is already in front**: choose **Minimize it**, **Hide it** or
+**Leave it open**.
 
 Or edit `~/.config/hyperlaunch/config` directly:
 
 ```
+hyperkey capslock = ctrl opt shift cmd
+remap mic = opt space
+
 when-in-front = minimize
 
 t = Terminal
@@ -71,9 +88,10 @@ b = /Applications/Safari.app
 e = /System/Library/CoreServices/Finder.app
 ```
 
-Keys are matched by position on a US keyboard, like Karabiner's `key_code`.
-Changes take effect the next time you press Caps Lock. To check the file for
-mistakes, run `~/.local/bin/hyperlaunch --check`.
+Keys are matched by position on a US keyboard, like Karabiner's `key_code`. Keys
+without a name can be written as `codeN` with their key code. Changes take effect
+as soon as you save. To check the file for mistakes, run
+`~/.local/bin/hyperlaunch --check`.
 
 ## Uninstall
 
@@ -86,15 +104,18 @@ the settings app and the login item. Your config file is kept.
 
 ## How it works
 
-1. `hidutil`, built into macOS, remaps Caps Lock to F18 at the keyboard-driver
-   level, so the caps-lock toggle never fires. The mapping is applied again when a
-   keyboard connects.
-2. A `CGEventTap` watches F18. While it's held, each key event gets the ⌘⌃⌥⇧
-   flags, or opens the app the config assigns to that key.
+1. A `CGEventTap` watches the keys in the config. A Hyper key's own presses are
+   swallowed, and while it's held, every other key event gets its modifiers. A
+   remapped key's events are rewritten into the shortcut, key down and key up.
+2. Caps Lock doesn't send a normal key press, so when it's set up, `hidutil`
+   (built into macOS) first remaps it to F18 at the keyboard-driver level. The
+   mapping is applied again when a keyboard connects.
 3. To minimize, hide and restore apps it uses the Accessibility API and
    `NSRunningApplication`, and it opens apps with `open -a`.
 
-Logs go to `~/Library/Logs/hyperlaunch.log`, one line per shortcut press.
+Logs go to `~/Library/Logs/hyperlaunch.log`: one line per app shortcut, and a
+line the first time each special top-row key is pressed, to help set it up. It
+never logs ordinary typing.
 
 ## Layout
 
@@ -103,6 +124,6 @@ Shared/Config.swift        config file format (used by both programs)
 Daemon/main.swift          background tool
 Settings/SettingsApp.swift settings window (SwiftUI)
 Settings/Info.plist, AppIcon.icns
-config                     example shortcuts
+config                     example config
 install.sh, uninstall.sh
 ```

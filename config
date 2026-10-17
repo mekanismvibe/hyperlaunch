@@ -1,16 +1,24 @@
-# hyperlaunch shortcuts:  key = app to open with Hyper (Caps Lock) + that key
-# (Hyperlaunch.app edits this file for you; you can also edit it by hand.)
+# hyperlaunch config. Hyperlaunch.app edits this file for you; you can also edit it
+# by hand. Changes apply as soon as you save. To check it: ~/.local/bin/hyperlaunch --check
 #
-# key: a-z, 0-9, f1-f12, space, return, tab, escape, delete, left, right, up, down,
-#      or one of  - [ ] ; ' , . / \ `   (write "equal" for the = key)
-# app: a full path, or just the app's name (anything `open -a` accepts)
+# Keys
+#   hyperkey <key> = <modifiers>   hold the key and other keys get these modifiers
+#                                  (cmd ctrl opt shift: all four make a full Hyper key)
+#   remap <key> = <modifiers> <key>  pressing the key presses this shortcut instead
+#   <key> can also be capslock, mic, spotlight or dnd (the top-row keys on recent
+#   Apple keyboards), or codeN for any other key code.
 #
-# when-in-front: what a shortcut does when its app is already in front.
+# App shortcuts (Hyper + key)
+#   <key> = <app>   the app is a full path, or just its name (anything `open -a` accepts)
+#   key names: a-z, 0-9, f1-f12, space, return, tab, escape, delete, left, right, up,
+#   down, or one of  - [ ] ; ' , . / \ `   (write "equal" for the = key)
+#
+# when-in-front: what an app shortcut does when its app is already in front.
 #   minimize (minimize its windows), hide (like Cmd+H), or nothing (just bring it forward).
 #   Pressing the shortcut again brings the app back.
-#
-# Changes apply as soon as you save; no restart needed.
-# To check this file:  ~/.local/bin/hyperlaunch --check
+
+hyperkey capslock = ctrl opt shift cmd
+# remap mic = opt space
 
 when-in-front = minimize
 

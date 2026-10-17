@@ -1,12 +1,14 @@
-// hyperlaunch: Caps Lock becomes a Hyper key (⌘⌃⌥⇧), and Hyper+key opens apps.
+// hyperlaunch: turns keys into Hyper keys (⌘⌃⌥⇧) or other shortcuts, and opens
+// apps with Hyper + a key.
 //
 // How it works:
-//   1. hidutil (built into macOS) remaps Caps Lock to F18 below the OS, so the
-//      caps-lock toggle and its light never fire.
-//   2. A keyboard event tap watches F18. While it's held, every key gets ⌘⌃⌥⇧
-//      added (so Hyper shortcuts in other apps keep working), and keys listed in
-//      the config open their app instead. If that app is already in front, the
-//      shortcut minimizes or hides it (the config's when-in-front setting).
+//   1. A keyboard event tap watches the keys the config remaps. A `hyperkey` adds
+//      its modifiers to every key pressed while it's held; a `remap` key is
+//      rewritten into its shortcut. Caps Lock can't be caught as a key press, so
+//      when it's remapped, hidutil (built into macOS) turns it into F18 first.
+//   2. With all four modifiers held, keys listed in the config open their app. If
+//      that app is already in front, the shortcut minimizes or hides it instead
+//      (the config's when-in-front setting).
 //
 // Build:   swiftc -O -swift-version 5 Shared/Config.swift Daemon/main.swift -o hyperlaunch
 // Config:  ~/.config/hyperlaunch/config   (re-read automatically after you save it)
@@ -16,12 +18,18 @@ import AppKit
 import ApplicationServices
 import IOKit.hid
 
-let f18: Int64 = 0x4F  // kVK_F18, what Caps Lock turns into
-
-// ⌘⌃⌥⇧ plus the device bits for the *left* keys, the same thing Karabiner sends.
-let hyperFlags: CGEventFlags = [.maskCommand, .maskControl, .maskAlternate, .maskShift,
-                                CGEventFlags(rawValue: 0x2B)]
 let hyperOnly: CGEventFlags = [.maskCommand, .maskControl, .maskAlternate, .maskShift]
+
+/// Event flags for some modifiers, with the device bits for the *left* keys, the
+/// same thing Karabiner sends.
+func eventFlags(_ mods: Mods) -> CGEventFlags {
+    var flags: CGEventFlags = []
+    if mods.contains(.ctrl) { flags.formUnion([.maskControl, CGEventFlags(rawValue: 0x01)]) }
+    if mods.contains(.shift) { flags.formUnion([.maskShift, CGEventFlags(rawValue: 0x02)]) }
+    if mods.contains(.cmd) { flags.formUnion([.maskCommand, CGEventFlags(rawValue: 0x08)]) }
+    if mods.contains(.opt) { flags.formUnion([.maskAlternate, CGEventFlags(rawValue: 0x20)]) }
+    return flags
+}
 
 let timestamp: DateFormatter = {
     let f = DateFormatter()
@@ -56,7 +64,13 @@ struct Target {
     }
 }
 
+enum Remap {
+    case hold(CGEventFlags)
+    case press(CGEventFlags, keyCode: Int64)
+}
+
 var targets: [Int64: Target] = [:]
+var remaps: [Int64: Remap] = [:]
 var whenInFront = WhenInFront.minimize
 var configStamp: Date?
 
@@ -65,19 +79,50 @@ func loadConfig() {
     guard let file = ConfigFile.load() else {
         log("no config at \(configPath)")
         targets = [:]
+        remaps = [:]
         return
     }
     let parsed = file.parse()
     parsed.problems.forEach { log("config \($0)") }
-    targets = Dictionary(parsed.shortcuts.map { (keyCodes[$0.key]!, Target($0.app)) },
+    targets = Dictionary(parsed.shortcuts.map { (keyCode($0.key)!, Target($0.app)) },
                          uniquingKeysWith: { a, _ in a })
+    remaps = Dictionary(parsed.remaps.map { remap -> (Int64, Remap) in
+        switch remap.action {
+        case .hold(let mods): return (sourceKeyCode(remap.source)!, .hold(eventFlags(mods)))
+        case .press(let mods, let key): return (sourceKeyCode(remap.source)!, .press(eventFlags(mods), keyCode: keyCode(key)!))
+        }
+    }, uniquingKeysWith: { a, _ in a })
     whenInFront = parsed.whenInFront
-    log("loaded \(targets.count) shortcuts (when in front: \(whenInFront.rawValue))")
+
+    // Keep held hyper keys in step with the new config.
+    for code in held.keys {
+        if case .hold(let flags) = remaps[code] { held[code] = flags } else { held[code] = nil }
+    }
+    if tap != nil { updateCapsLockMapping() }
+    log("loaded \(targets.count) shortcuts and \(remaps.count) remapped keys (when in front: \(whenInFront.rawValue))")
 }
 
 func reloadConfigIfChanged() {
     let stamp = (try? FileManager.default.attributesOfItem(atPath: configPath))?[.modificationDate] as? Date
     if stamp != configStamp { loadConfig() }
+}
+
+var configWatcher: DispatchSourceFileSystemObject?
+
+/// Reloads as soon as the config is saved. Watches the folder, since most editors
+/// (and the settings app) save by replacing the file.
+func watchConfig() {
+    let folder = (configPath as NSString).deletingLastPathComponent
+    let fd = open(folder, O_EVTONLY)
+    guard fd >= 0 else {
+        log("can't watch \(folder) for changes")
+        return
+    }
+    let source = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: [.write, .rename], queue: .main)
+    source.setEventHandler(handler: reloadConfigIfChanged)
+    source.setCancelHandler { close(fd) }
+    source.resume()
+    configWatcher = source
 }
 
 // MARK: - Windows (Accessibility API)
@@ -164,6 +209,8 @@ func toggle(_ target: Target, _ mode: WhenInFront) {
     log("\(target.name): opened\(restored > 0 ? ", restored \(restored) window(s)" : "")")
 }
 
+var capsLockMapped = false
+
 func mapCapsLockToF18(_ on: Bool) {
     // HID usages: 0x700000039 is Caps Lock, 0x70000006D is F18.
     let mapping = on
@@ -181,15 +228,40 @@ func mapCapsLockToF18(_ on: Bool) {
     }
 }
 
+/// Turns the Caps Lock → F18 remap on or off to match the config.
+func updateCapsLockMapping() {
+    let wanted = remaps[capsLockCode] != nil
+    if wanted != capsLockMapped {
+        mapCapsLockToF18(wanted)
+        capsLockMapped = wanted
+    }
+}
+
 // MARK: - Keyboard handling
 
 var tap: CFMachPort?
-var hyperDown = false
+var held: [Int64: CGEventFlags] = [:]  // hyper keys held right now, and the modifiers they add
+var keyStateWorks: [Int64: Bool] = [:]
 var swallowed = Set<Int64>()  // keys whose keyDown opened an app; drop their keyUp too
-var keyStateWorks = false
+var noticed = Set<Int64>()  // special keys already written to the log
 
-func f18IsHeld() -> Bool {
-    CGEventSource.keyState(.hidSystemState, key: CGKeyCode(f18))
+let systemDefined: UInt32 = 14  // NX_SYSDEFINED: media keys and other special keys
+
+func isHeld(_ code: Int64) -> Bool {
+    CGEventSource.keyState(.hidSystemState, key: CGKeyCode(code))
+}
+
+/// Logs each special top-row key once, so you can tell what a key sends if it
+/// can't be picked in the settings app. Ordinary typing is never logged.
+func notice(_ type: CGEventType, _ event: CGEvent) {
+    if type.rawValue == systemDefined {
+        guard let ns = NSEvent(cgEvent: event), ns.subtype.rawValue == 8 else { return }  // 8: special keys
+        let keyType = Int64((ns.data1 & 0xFFFF_0000) >> 16)
+        if noticed.insert(0x10000 + keyType).inserted { log("noticed system key type \(keyType)") }
+    } else {
+        let key = event.getIntegerValueField(.keyboardEventKeycode)
+        if key >= 0x80, noticed.insert(key).inserted { log("noticed special key \"\(keyName(key))\"") }
+    }
 }
 
 func handle(_ type: CGEventType, _ event: CGEvent) -> Unmanaged<CGEvent>? {
@@ -197,41 +269,55 @@ func handle(_ type: CGEventType, _ event: CGEvent) -> Unmanaged<CGEvent>? {
         if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
         return Unmanaged.passUnretained(event)
     }
+    if type.rawValue == systemDefined {
+        notice(type, event)
+        return Unmanaged.passUnretained(event)
+    }
     let key = event.getIntegerValueField(.keyboardEventKeycode)
     let isDown = type == .keyDown
+    let isRepeat = event.getIntegerValueField(.keyboardEventAutorepeat) != 0
 
-    if key == f18 {
-        if isDown && !hyperDown {
-            hyperDown = true
-            keyStateWorks = f18IsHeld()
+    switch remaps[key] {
+    case .hold(let flags):
+        if isDown && held[key] == nil {
+            held[key] = flags
+            keyStateWorks[key] = isHeld(key)
             reloadConfigIfChanged()
         } else if !isDown {
-            hyperDown = false
+            held[key] = nil
         }
-        return nil  // Caps Lock itself never reaches apps
+        return nil  // the hyper key itself never reaches apps
+    case .press(let flags, let target):
+        event.setIntegerValueField(.keyboardEventKeycode, value: target)
+        event.flags = flags.union(event.flags.intersection(.maskNonCoalesced))
+        return Unmanaged.passUnretained(event)
+    case nil:
+        break
     }
+    if isDown && !isRepeat { notice(type, event) }
 
     if !isDown && swallowed.remove(key) != nil { return nil }
 
-    // Password fields hide key events from taps, so a Caps Lock release can go
-    // missing. If the system's key state is readable, use it to un-stick Hyper.
-    if hyperDown && keyStateWorks && !f18IsHeld() { hyperDown = false }
-
-    // Like the Karabiner rule, a real ⌘⌃⌥⇧ held down also counts as Hyper for launching.
-    guard hyperDown || event.flags.isSuperset(of: hyperOnly) else {
-        return Unmanaged.passUnretained(event)
+    // Password fields hide key events from taps, so a hyper key's release can go
+    // missing. Where the system's key state is readable, use it to un-stick it.
+    for code in held.keys where keyStateWorks[code] == true && !isHeld(code) {
+        held[code] = nil
     }
 
-    if isDown, let target = targets[key] {
+    let added = held.values.reduce(CGEventFlags()) { $0.union($1) }
+    let flags = event.flags.union(added)
+
+    // All four modifiers, from hyper keys or real ones like the Karabiner rule, open apps.
+    if isDown, flags.isSuperset(of: hyperOnly), let target = targets[key] {
         swallowed.insert(key)
-        if event.getIntegerValueField(.keyboardEventAutorepeat) == 0 {
+        if !isRepeat {
             let mode = whenInFront
             actions.async { toggle(target, mode) }
         }
         return nil
     }
 
-    if hyperDown { event.flags.formUnion(hyperFlags) }
+    if !added.isEmpty { event.flags = flags }
     return Unmanaged.passUnretained(event)
 }
 
@@ -239,6 +325,7 @@ var askedForAccess = false
 
 func startTap() {
     let mask = (CGEventMask(1) << CGEventType.keyDown.rawValue) | (CGEventMask(1) << CGEventType.keyUp.rawValue)
+        | (CGEventMask(1) << systemDefined)
     guard let newTap = CGEvent.tapCreate(tap: .cghidEventTap, place: .headInsertEventTap,
                                          options: .defaultTap, eventsOfInterest: mask,
                                          callback: { _, type, event, _ in handle(type, event) },
@@ -254,9 +341,10 @@ func startTap() {
     tap = newTap
     CFRunLoopAddSource(CFRunLoopGetMain(), CFMachPortCreateRunLoopSource(nil, newTap, 0), .commonModes)
     CGEvent.tapEnable(tap: newTap, enable: true)
-    mapCapsLockToF18(true)
+    updateCapsLockMapping()
     reapplyWhenKeyboardsConnect()
-    log("ready: Caps Lock is Hyper")
+    let names = remaps.keys.map { keyLabel(sourceKeyName($0)) }.sorted()
+    log("ready: \(names.isEmpty ? "no keys remapped yet" : "remapped " + names.joined(separator: ", "))")
 }
 
 // MARK: - Keyboards connecting later
@@ -278,7 +366,7 @@ func reapplyWhenKeyboardsConnect() {
                                      { _, iterator in
                                          drain(iterator)
                                          DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
-                                             mapCapsLockToF18(true)
+                                             if capsLockMapped { mapCapsLockToF18(true) }
                                          }
                                      }, nil, &keyboardIterator)
     drain(keyboardIterator)  // these are the keyboards already connected; draining arms the notification
@@ -302,6 +390,9 @@ if CommandLine.arguments.dropFirst().first == "--check" {
     }
     let parsed = file.parse()
     var missing = 0
+    for remap in parsed.remaps {
+        print("\(keyLabel(remap.source))  ->  \(remap.summary)")
+    }
     print("when in front: \(parsed.whenInFront.rawValue)")
     for shortcut in parsed.shortcuts {
         let found = resolveApp(shortcut.app).map { FileManager.default.fileExists(atPath: $0.path) } ?? false
@@ -317,7 +408,7 @@ for sig in [SIGINT, SIGTERM] {
     signal(sig, SIG_IGN)
     let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
     source.setEventHandler {
-        mapCapsLockToF18(false)  // give Caps Lock back
+        if capsLockMapped { mapCapsLockToF18(false) }  // give Caps Lock back
         exit(0)
     }
     source.resume()
@@ -326,5 +417,6 @@ for sig in [SIGINT, SIGTERM] {
 
 AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), 1.0)  // don't wait long on a frozen app
 loadConfig()
+watchConfig()
 startTap()
 CFRunLoopRun()
