@@ -74,15 +74,17 @@ var remaps: [Int64: Remap] = [:]
 var whenInFront = WhenInFront.minimize
 var configStamp: Date?
 
+/// When the config was last changed. Follows a symlinked config to the real file.
+func configModified() -> Date? {
+    let path = URL(fileURLWithPath: configPath).resolvingSymlinksInPath().path
+    return (try? FileManager.default.attributesOfItem(atPath: path))?[.modificationDate] as? Date
+}
+
 func loadConfig() {
-    configStamp = (try? FileManager.default.attributesOfItem(atPath: configPath))?[.modificationDate] as? Date
-    guard let file = ConfigFile.load() else {
-        log("no config at \(configPath)")
-        targets = [:]
-        remaps = [:]
-        return
-    }
-    let parsed = file.parse()
+    configStamp = configModified()
+    let file = ConfigFile.load()
+    if file == nil { log("no config at \(configPath)") }
+    let parsed = file?.parse() ?? ParsedConfig()
     parsed.problems.forEach { log("config \($0)") }
     targets = Dictionary(parsed.shortcuts.map { (keyCode($0.key)!, Target($0.app)) },
                          uniquingKeysWith: { a, _ in a })
@@ -103,26 +105,49 @@ func loadConfig() {
 }
 
 func reloadConfigIfChanged() {
-    let stamp = (try? FileManager.default.attributesOfItem(atPath: configPath))?[.modificationDate] as? Date
-    if stamp != configStamp { loadConfig() }
+    if configModified() != configStamp { loadConfig() }
 }
 
 var configWatcher: DispatchSourceFileSystemObject?
+var configFileWatcher: DispatchSourceFileSystemObject?
+var retryingConfigWatch = false
 
-/// Reloads as soon as the config is saved. Watches the folder, since most editors
-/// (and the settings app) save by replacing the file.
-func watchConfig() {
-    let folder = (configPath as NSString).deletingLastPathComponent
-    let fd = open(folder, O_EVTONLY)
-    guard fd >= 0 else {
-        log("can't watch \(folder) for changes")
-        return
-    }
-    let source = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: [.write, .rename], queue: .main)
-    source.setEventHandler(handler: reloadConfigIfChanged)
+func watch(_ path: String, _ handler: @escaping () -> Void) -> DispatchSourceFileSystemObject? {
+    let fd = open(path, O_EVTONLY)
+    guard fd >= 0 else { return nil }
+    let source = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: [.write, .extend, .delete, .rename],
+                                                           queue: .main)
+    source.setEventHandler(handler: handler)
     source.setCancelHandler { close(fd) }
     source.resume()
-    configWatcher = source
+    return source
+}
+
+/// Watches the config file itself (editors that save in place, or a symlinked
+/// config), re-armed each time since a save can replace the file.
+func configChanged() {
+    configFileWatcher?.cancel()
+    configFileWatcher = watch(configPath, configChanged)
+    // A symlinked config whose file was moved away mid-save: nothing watches the
+    // folder the new file will appear in, so look again shortly.
+    if configFileWatcher == nil, !retryingConfigWatch,
+       (try? FileManager.default.destinationOfSymbolicLink(atPath: configPath)) != nil {
+        retryingConfigWatch = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+            retryingConfigWatch = false
+            configChanged()
+        }
+    }
+    reloadConfigIfChanged()
+}
+
+/// Reloads as soon as the config is saved. Watches the folder, since most editors
+/// (and the settings app) save by replacing the file, and the file, for the rest.
+func watchConfig() {
+    let folder = (configPath as NSString).deletingLastPathComponent
+    configWatcher = watch(folder, configChanged)
+    if configWatcher == nil { log("can't watch \(folder) for changes") }
+    configChanged()
 }
 
 // MARK: - Windows (Accessibility API)
@@ -228,11 +253,23 @@ func mapCapsLockToF18(_ on: Bool) {
     }
 }
 
+/// Switches Caps Lock off. Once the key is F18, nothing could switch it off again.
+func capsLockOff() {
+    let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching(kIOHIDSystemClass))
+    guard service != 0 else { return }
+    defer { IOObjectRelease(service) }
+    var connect: io_connect_t = 0
+    guard IOServiceOpen(service, mach_task_self_, UInt32(kIOHIDParamConnectType), &connect) == KERN_SUCCESS else { return }
+    defer { IOServiceClose(connect) }
+    IOHIDSetModifierLockState(connect, Int32(kIOHIDCapsLockState), false)
+}
+
 /// Turns the Caps Lock → F18 remap on or off to match the config.
 func updateCapsLockMapping() {
     let wanted = remaps[capsLockCode] != nil
     if wanted != capsLockMapped {
         mapCapsLockToF18(wanted)
+        if wanted { capsLockOff() }
         capsLockMapped = wanted
     }
 }
@@ -296,7 +333,13 @@ func handle(_ type: CGEventType, _ event: CGEvent) -> Unmanaged<CGEvent>? {
     }
     if isDown && !isRepeat { notice(type, event) }
 
-    if !isDown && swallowed.remove(key) != nil { return nil }
+    if swallowed.contains(key) {
+        if !isDown || isRepeat {
+            if !isDown { swallowed.remove(key) }
+            return nil  // still part of the press that opened an app, even if Hyper was let go
+        }
+        swallowed.remove(key)  // a new press: the last one's keyUp went missing (secure input)
+    }
 
     // Password fields hide key events from taps, so a hyper key's release can go
     // missing. Where the system's key state is readable, use it to un-stick it.
@@ -309,8 +352,10 @@ func handle(_ type: CGEventType, _ event: CGEvent) -> Unmanaged<CGEvent>? {
 
     // All four modifiers, from hyper keys or real ones like the Karabiner rule, open apps.
     if isDown, flags.isSuperset(of: hyperOnly), let target = targets[key] {
-        swallowed.insert(key)
+        // A repeat here means the press began before Hyper and its keyDown reached
+        // the app, so let its keyUp through too.
         if !isRepeat {
+            swallowed.insert(key)
             let mode = whenInFront
             actions.async { toggle(target, mode) }
         }

@@ -112,12 +112,20 @@ final class Model: ObservableObject {
     }
 
     private func edit(_ change: (inout ConfigFile) -> Void) {
-        file = ConfigFile.load() ?? file  // pick up hand edits made since the window opened
+        if let current = ConfigFile.load() {
+            file = current  // pick up hand edits made since the window opened
+        } else if FileManager.default.fileExists(atPath: configPath) {
+            // It's there but unreadable (say, not UTF-8): saving would replace it with what we have.
+            saveError = "Couldn't read \(configPath), so it was left as it is."
+            return
+        }
+        let saved = file
         change(&file)
         do {
             try file.save()
             saveError = nil
         } catch {
+            file = saved  // don't show a change that didn't make it to disk
             saveError = error.localizedDescription
         }
         refresh()
@@ -563,6 +571,10 @@ struct RemapSheet: View {
                     .pickerStyle(.segmented)
                     .labelsHidden()
                     .fixedSize()
+                    .onChange(of: draft.isHyper) {
+                        // The Record button is gone, so stop it eating the next key press.
+                        if draft.listening == .shortcut { draft.listen(nil) }
+                    }
                 }
                 if draft.isHyper {
                     GridRow {

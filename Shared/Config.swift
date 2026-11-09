@@ -8,6 +8,14 @@
 // One entry per line; # starts a comment.
 
 import Foundation
+#if canImport(AppKit)
+import AppKit
+
+/// NSWorkspace's name lookup (what `open -a` uses) is deprecated but has no
+/// replacement that takes a name; calling it through this protocol avoids the warning.
+private protocol AppNameLookup { func fullPath(forApplication appName: String) -> String? }
+extension NSWorkspace: AppNameLookup {}
+#endif
 
 let configPath = NSHomeDirectory() + "/.config/hyperlaunch/config"
 
@@ -131,7 +139,7 @@ struct KeyRemap: Equatable {
         guard sourceKeyCode(source) != nil else { return (nil, "unknown key \"\(source)\"") }
         var mods = Mods()
         var keys: [String] = []
-        for word in value.lowercased().split(whereSeparator: { $0 == " " || $0 == "+" }).map(String.init) {
+        for word in value.lowercased().split(whereSeparator: { $0.isWhitespace || $0 == "+" }).map(String.init) {
             if let mod = Mods(word: word) { mods.insert(mod) } else { keys.append(word) }
         }
         if name.hasPrefix("hyperkey") {
@@ -173,25 +181,53 @@ func resolveApp(_ app: String) -> URL? {
     for dir in dirs where FileManager.default.fileExists(atPath: dir + "/" + file) {
         return URL(fileURLWithPath: dir + "/" + file)
     }
+    #if canImport(AppKit)
+    // Anywhere else Launch Services knows of (Setapp, app subfolders), like `open -a`.
+    if let path = (NSWorkspace.shared as AppNameLookup).fullPath(forApplication: app) { return URL(fileURLWithPath: path) }
+    #endif
     return nil
 }
 
 /// The config file as lines, so edits from the settings app keep your comments.
 struct ConfigFile {
     var lines: [String]
+    /// The file wasn't valid UTF-8 and was read with U+FFFD in place of the bad bytes,
+    /// so saving it would overwrite those bytes for good.
+    private(set) var lossy = false
 
     init(text: String) {
-        lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        // Swift sees "\r\n" as one Character, not "\n", so split on every line ending:
+        // otherwise a file saved with CRLF (or old Mac CR) endings reads as one line.
+        lines = text.split(omittingEmptySubsequences: false, whereSeparator: { $0 == "\n" || $0 == "\r\n" || $0 == "\r" })
+            .map(String.init)
         if lines.last == "" { lines.removeLast() }
     }
 
     static func load(_ path: String = configPath) -> ConfigFile? {
-        (try? String(contentsOfFile: path, encoding: .utf8)).map(ConfigFile.init(text:))
+        guard let data = FileManager.default.contents(atPath: path) else { return nil }
+        // A stray non-UTF-8 byte (say, in a comment) mustn't make the file look missing:
+        // that drops every entry, and the settings app would then save over it.
+        if let text = String(data: data, encoding: .utf8) { return ConfigFile(text: text) }
+        let text = String(decoding: data, as: UTF8.self)  // unlike the line above, this keeps a BOM
+        var file = ConfigFile(text: text.hasPrefix("\u{FEFF}") ? String(text.dropFirst()) : text)
+        file.lossy = true
+        return file
     }
 
     var text: String { lines.joined(separator: "\n") + "\n" }
 
+    struct NotUTF8Error: LocalizedError {
+        let path: String
+        var errorDescription: String? {
+            "\(path) has text that isn't UTF-8, so it was left as it is. Save it as UTF-8 in a text editor to change it here."
+        }
+    }
+
     func save(_ path: String = configPath) throws {
+        if lossy { throw NotUTF8Error(path: path) }
+        // Write to the real file behind a symlinked config (dotfiles, stow): an atomic
+        // write to the link itself would replace the link with a copy.
+        let path = URL(fileURLWithPath: path).resolvingSymlinksInPath().path
         try FileManager.default.createDirectory(atPath: (path as NSString).deletingLastPathComponent,
                                                 withIntermediateDirectories: true)
         try text.write(toFile: path, atomically: true, encoding: .utf8)
@@ -211,7 +247,7 @@ struct ConfigFile {
 
     /// The key a `hyperkey <key>` or `remap <key>` name is about.
     static func remapSource(name: String) -> String? {
-        let words = name.split(separator: " ")
+        let words = name.split(whereSeparator: \.isWhitespace)
         guard words.count == 2, words[0] == "hyperkey" || words[0] == "remap" else { return nil }
         return String(words[1])
     }
@@ -301,6 +337,9 @@ struct ConfigFile {
         let line = "when-in-front = \(whenInFront.rawValue)"
         if let i = index(of: "when-in-front") {
             lines[i] = line
+            // parse() uses the last valid one, so drop any others or this change wouldn't stick.
+            lines = lines.enumerated().filter { $0.offset == i || ConfigFile.split($0.element)?.name != "when-in-front" }
+                .map(\.element)
         } else {
             lines.insert(contentsOf: [line, ""], at: firstEntry)
         }
